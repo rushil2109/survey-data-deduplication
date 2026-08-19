@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 
 from gql import Client, gql
+from gql.transport.exceptions import TransportQueryError, TransportServerError
 from gql.transport.requests import RequestsHTTPTransport
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ class SurveyApiClient:
         self.timeout = timeout
         self.retries = retries
         self.token: Optional[str] = None
+        # Created once in authenticate(); None until then.
+        self._gql_client: Optional[Client] = None
 
     def _request(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         # Authentication is a REST endpoint, so gql cannot be used for this call.
@@ -58,29 +61,81 @@ class SurveyApiClient:
         if not isinstance(token, str) or not token:
             raise ApiError("authentication response did not contain access_token")
         self.token = token
-
-    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        if not self.token:
-            raise ApiError("client is not authenticated")
+        # Build the gql client once so the underlying requests.Session is reused
+        # across all GraphQL calls (keeps connections alive, avoids per-call overhead).
         transport = RequestsHTTPTransport(
             url=f"{self.base_url}/graphql",
             headers={"Authorization": f"Bearer {self.token}"},
             timeout=self.timeout,
         )
-        graphql_client = Client(transport=transport, fetch_schema_from_transport=False)
-        try:
-            result = graphql_client.execute(gql(query), variable_values=variables)
-        except Exception as exc:
-            raise ApiError(f"GraphQL request failed: {exc}") from exc
-        if not isinstance(result, dict):
-            raise ApiError("GraphQL response data was not an object")
-        return result
+        self._gql_client = Client(transport=transport, fetch_schema_from_transport=False)
+
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        if self._gql_client is None:
+            raise ApiError("client is not authenticated; call authenticate() first")
+
+        # Mirror the retry/backoff policy used by _request so all network calls
+        # degrade gracefully under transient server-side failures.
+        last_exc: Exception = ApiError("GraphQL request failed")
+        for attempt in range(self.retries + 1):
+            try:
+                # Enter the client as a context manager per call so gql manages
+                # the connection lifecycle (keep-alive, session pooling) correctly.
+                with self._gql_client as session:
+                    result = session.execute(gql(query), variable_values=variables)
+                if not isinstance(result, dict):
+                    raise ApiError("GraphQL response data was not an object")
+                return result
+            except TransportServerError as exc:
+                # HTTP 5xx / 429 — transient; worth retrying.
+                last_exc = exc
+                if attempt == self.retries:
+                    raise ApiError(f"GraphQL request failed after {self.retries + 1} attempts: {exc}") from exc
+            except TransportQueryError as exc:
+                # Application-level GraphQL error (e.g. bad query, 400) — not retryable.
+                raise ApiError(f"GraphQL request failed: {exc}") from exc
+            except ApiError:
+                raise
+            except Exception as exc:
+                # Any other unexpected transport error — not retryable.
+                raise ApiError(f"GraphQL request failed: {exc}") from exc
+            time.sleep(0.1 * (2**attempt))
+
+        raise ApiError(f"GraphQL request failed after {self.retries + 1} attempts: {last_exc}") from last_exc
 
     def existing_response_ids(self, response_ids: list[str]) -> set[str]:
-        query = "query($responseIds: [UUID!]!) { surveyResponsesByResponseIds(responseIds: $responseIds) { responseId } }"
-        records = self._graphql(query, {"responseIds": response_ids}).get("surveyResponsesByResponseIds", [])
-        return {record["responseId"] for record in records}
+        # Operation name enables server-side tracing and APM identification.
+        query = """
+            query CheckExistingResponses($responseIds: [UUID!]!) {
+                surveyResponsesByResponseIds(responseIds: $responseIds) {
+                    responseId
+                }
+            }
+        """
+        try:
+            records = self._graphql(query, {"responseIds": response_ids}).get("surveyResponsesByResponseIds", [])
+            # Use .get() so a missing field returns None instead of raising KeyError;
+            # then filter Nones so null responseId values are silently excluded.
+            ids = {record.get("responseId") for record in records}
+            ids.discard(None)
+            return ids  # type: ignore[return-value]
+        except ApiError:
+            raise
+        except (KeyError, TypeError) as exc:
+            raise ApiError(f"unexpected structure in surveyResponsesByResponseIds response: {exc}") from exc
 
     def upload(self, responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        mutation = "mutation($input: [CreateSurveyResponseInput!]!) { createSurveyResponses(input: $input) { responseId } }"
-        return self._graphql(mutation, {"input": responses}).get("createSurveyResponses", [])
+        # Operation name enables server-side tracing and APM identification.
+        mutation = """
+            mutation UploadSurveyResponses($input: [CreateSurveyResponseInput!]!) {
+                createSurveyResponses(input: $input) {
+                    responseId
+                }
+            }
+        """
+        try:
+            return self._graphql(mutation, {"input": responses}).get("createSurveyResponses", [])
+        except ApiError:
+            raise
+        except (KeyError, TypeError) as exc:
+            raise ApiError(f"unexpected structure in createSurveyResponses response: {exc}") from exc
