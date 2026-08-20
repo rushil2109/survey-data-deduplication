@@ -14,9 +14,11 @@ def _datetime_value(value: datetime) -> str:
 
 @dataclass(frozen=True)
 class SurveyResponse:
+    # Represents a response already stored in the database (includes server-assigned id).
     id: UUID
     responseId: UUID
     surveyId: str
+    # TODO: validate answers structure against a known schema rather than accepting Any.
     answers: Any
     submittedAt: datetime
 
@@ -32,8 +34,10 @@ class SurveyResponse:
 
 @dataclass(frozen=True)
 class CreateSurveyResponseInput:
+    # Input-only model for the createSurveyResponses mutation; no server-assigned id.
     responseId: UUID
     surveyId: str
+    # TODO: validate answers structure against a known schema rather than accepting Any.
     answers: Any
     submittedAt: datetime
 

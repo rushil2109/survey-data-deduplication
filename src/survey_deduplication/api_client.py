@@ -21,6 +21,14 @@ class ApiError(Exception):
 
 
 class SurveyApiClient:
+    """Handles authentication and all GraphQL communication with the survey API.
+
+    Call authenticate() before any GraphQL method. A single token is used for
+    the lifetime of the client; there is no automatic token refresh.
+    # TODO: add token refresh logic for long-running processes where the token
+    # may expire mid-run (token lifetime is returned as expires_in in the auth response).
+    """
+
     def __init__(self, base_url: str, client_id: str, client_secret: str, timeout: float = 10, retries: int = 2):
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
@@ -125,6 +133,9 @@ class SurveyApiClient:
             raise ApiError(f"unexpected structure in surveyResponsesByResponseIds response: {exc}") from exc
 
     def upload(self, responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # TODO: on partial batch failure, retry each record individually to isolate
+        # the bad record rather than dropping the entire batch. Currently a single
+        # bad record causes the whole batch to be skipped and logged.
         # Operation name enables server-side tracing and APM identification.
         mutation = """
             mutation UploadSurveyResponses($input: [CreateSurveyResponseInput!]!) {

@@ -11,11 +11,15 @@ logger = logging.getLogger(__name__)
 
 
 def chunks(items: list, size: int):
+    # Split a list into fixed-size batches. Batching limits request size and
+    # isolates failures — if one batch is rejected, later batches still proceed.
     for start in range(0, len(items), size):
         yield items[start : start + size]
 
 
 def run(args: argparse.Namespace) -> int:
+    # Main pipeline: read → authenticate → query existing → deduplicate → upload.
+    # Authentication failure is fatal; query/upload failures are logged per batch.
     if args.query_batch_size < 1 or args.upload_batch_size < 1:
         logger.error("Batch sizes must be positive")
         return 1
@@ -34,10 +38,19 @@ def run(args: argparse.Namespace) -> int:
         try:
             existing.update(client.existing_response_ids(batch_ids))
         except ApiError as exc:
-            # Never upload records whose duplicate status is unknown.
+            # If the duplicate-check query fails for a batch, we cannot know whether
+            # those records already exist. Uploading them risks creating duplicates, so
+            # they are excluded from the upload entirely and logged for investigation.
+            # TODO: persist progress so a re-run can retry just the failed query batches
+            # rather than reprocessing the whole file.
             query_failed_ids.update(batch_ids)
             logger.error("Duplicate query failed for response_ids=%s: %s", batch_ids, exc)
 
+    # Filter before upload so the mutation only receives genuinely new records.
+    # A production backend would enforce a UNIQUE constraint on responseId, so any
+    # duplicate that slipped through (e.g. from a concurrent run) would be a hard
+    # error rather than a silent overwrite — but the client-side filter is the first
+    # line of defence and avoids unnecessary write load.
     new_responses = [
         response
         for response in responses
@@ -49,7 +62,9 @@ def run(args: argparse.Namespace) -> int:
         try:
             uploaded += len(client.upload([response.as_dict() for response in batch]))
         except ApiError as exc:
-            # Continue with later batches; per-record retry is a future improvement.
+            # One failed batch does not stop the run; later batches may succeed.
+            # TODO: retry failed batches record-by-record to isolate the bad record
+            # instead of skipping the whole batch.
             failed_batches += 1
             logger.error("Upload batch failed for response_ids=%s: %s", [str(response.responseId) for response in batch], exc)
 

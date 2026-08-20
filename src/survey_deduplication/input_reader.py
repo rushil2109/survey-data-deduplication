@@ -27,6 +27,10 @@ def read_responses(path: Union[str, Path]) -> Tuple[List[CreateSurveyResponseInp
     # Invalid records are isolated so one bad row does not stop a complete run.
     valid: list[CreateSurveyResponseInput] = []
     skipped = 0
+    # Track responseIds already seen in this file to catch within-file duplicates
+    # before reaching the API. The API is the authoritative source for cross-run
+    # duplicates; this catches same-file duplicates that the API would otherwise
+    # accept on a first-seen basis.
     seen: set[str] = set()
     for index, record in enumerate(records):
         if not isinstance(record, dict):
